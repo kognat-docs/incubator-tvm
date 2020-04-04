@@ -24,14 +24,14 @@ PKG_CFLAGS = -std=c++11 -O2 -fPIC\
 	-I${DMLC_CORE}/include\
 	-I${TVM_ROOT}/3rdparty/dlpack/include\
 
-PKG_LDFLAGS = -L${TVM_ROOT}/build -ldl -pthread
+PKG_LDFLAGS = -L${TVM_ROOT}/build -ldl -pthread -framework Metal -framework MetalKit -framework Cocoa -framework CoreFoundation -fobjc-link-runtime
 
 .PHONY: clean all
 
 all: lib/cpp_deploy_pack lib/cpp_deploy_normal
 
 # Build rule for all in one TVM package library
-lib/libtvm_runtime_pack.o: tvm_runtime_pack.cc
+lib/libtvm_runtime_pack.o: tvm_runtime_pack.mm
 	@mkdir -p $(@D)
 	$(CXX) -c $(PKG_CFLAGS) -o $@  $^
 
@@ -41,12 +41,12 @@ lib/test_addone_sys.o: prepare_test_libs.py
 	python3 prepare_test_libs.py
 
 # Deploy using the all in one TVM package library
-lib/cpp_deploy_pack: cpp_deploy.cc lib/test_addone_sys.o lib/libtvm_runtime_pack.o
+lib/cpp_deploy_pack: cpp_deploy.mm lib/test_addone_sys.o lib/libtvm_runtime_pack.o
 	@mkdir -p $(@D)
 	$(CXX) $(PKG_CFLAGS) -o $@  $^ $(PKG_LDFLAGS)
 
 # Deploy using pre-built libtvm_runtime.so
-lib/cpp_deploy_normal: cpp_deploy.cc lib/test_addone_sys.o
+lib/cpp_deploy_normal: cpp_deploy.mm lib/test_addone_sys.o
 	@mkdir -p $(@D)
 	$(CXX) $(PKG_CFLAGS) -o $@  $^ -ltvm_runtime $(PKG_LDFLAGS)
 clean:

@@ -67,18 +67,18 @@
 // #include "../../src/runtime/rpc/rpc_server_env.cc"
 
 // These macros enables the device API when uncommented.
-#define TVM_CUDA_RUNTIME 1
+//#define TVM_CUDA_RUNTIME 1
 #define TVM_METAL_RUNTIME 1
-#define TVM_OPENCL_RUNTIME 1
+//#define TVM_OPENCL_RUNTIME 1
 
 // Uncomment the following lines to enable Metal
-// #include "../../src/runtime/metal/metal_device_api.mm"
-// #include "../../src/runtime/metal/metal_module.mm"
+#include "../../src/runtime/metal/metal_device_api.mm"
+#include "../../src/runtime/metal/metal_module.mm"
 
 // Uncomment the following lines to enable CUDA
 // #include "../../src/runtime/cuda/cuda_device_api.cc"
 // #include "../../src/runtime/cuda/cuda_module.cc"
 
 // Uncomment the following lines to enable OpenCL
-// #include "../../src/runtime/opencl/opencl_device_api.cc"
-// #include "../../src/runtime/opencl/opencl_module.cc"
+//#include "../../src/runtime/opencl/opencl_device_api.cc"
+//#include "../../src/runtime/opencl/opencl_module.cc"
