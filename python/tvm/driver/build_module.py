@@ -14,6 +14,8 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# pylint: disable=invalid-name
 """The build utils in python.
 
 This module provides the functions to transform schedule to
@@ -25,6 +27,7 @@ import tvm.tir
 
 from tvm.runtime import ndarray
 from tvm.ir import container
+from tvm.ir import CallingConv
 from tvm.target import codegen, BuildConfig
 from tvm.tir import ir_pass
 from tvm.tir.stmt import LoweredFunc
@@ -159,6 +162,7 @@ def lower(sch,
     # Phase 1
     stmt = ir_pass.RewriteForTensorCore(stmt, sch, binds)
     stmt = ir_pass.StorageFlatten(stmt, binds, 64, cfg.instrument_bound_checkers)
+    stmt = ir_pass.NarrowDataType(stmt, 32)
     stmt = ir_pass.CanonicalSimplify(stmt)
     for f in lower_phase1:
         stmt = f(stmt)
@@ -222,57 +226,59 @@ def _build_for_device(flist, target, target_host):
         A module that contains device code.
     """
     target = _target.create(target)
+    target_host = _target.create(target_host)
     device_type = ndarray.context(target.target_name, 0).device_type
-    fhost = []
-    fdevice = []
+
     for func in flist:
         if not ir_pass.VerifyMemory(func, device_type):
             raise ValueError(
                 "Direct host side access to device memory is detected in %s. "
                 "Did you forget to bind?" % func.name)
-        if func.func_type == LoweredFunc.MixedFunc:
-            if BuildConfig.current().detect_global_barrier:
-                func = ir_pass.ThreadSync(func, "global")
-            func = ir_pass.ThreadSync(func, "shared")
-            func = ir_pass.ThreadSync(func, "warp")
-            func = ir_pass.InferFragment(func)
-            warp_size = target.thread_warp_size
-            func = ir_pass.LowerThreadAllreduce(func, warp_size)
-            fsplits = list(ir_pass.SplitHostDevice(func))
-            fhost.append(fsplits[0])
-            for x in fsplits[1:]:
-                fdevice.append(x)
-        elif func.func_type == LoweredFunc.HostFunc:
-            fhost.append(func)
-        elif func.func_type == LoweredFunc.DeviceFunc:
-            fdevice.append(func)
-        else:
-            raise ValueError("unknown function type %d" % func.func_type)
 
-    for i, func in enumerate(fdevice):
-        warp_size = target.thread_warp_size
-        fdevice[i] = ir_pass.LowerWarpMemory(func, warp_size)
+    mod_mixed = tvm.testing.LoweredFuncsToIRModule(flist)
+    opt_mixed = [tvm.tir.transform.Apply(lambda f: f.with_attr("target", target))]
+    if BuildConfig.current().detect_global_barrier:
+        opt_mixed += [tvm.tir.transform.ThreadSync("global")]
+    opt_mixed += [tvm.tir.transform.ThreadSync("shared"),
+                  tvm.tir.transform.ThreadSync("warp"),
+                  tvm.tir.transform.InferFragment(),
+                  tvm.tir.transform.LowerThreadAllreduce(),
+                  tvm.tir.transform.BindDeviceType(),
+                  tvm.tir.transform.SplitHostDevice()]
+    mod_mixed = tvm.ir.transform.Sequential(opt_mixed)(mod_mixed)
 
-    if "gpu" in target.keys and not fdevice:
+
+    # device optimizations
+    opt_device = tvm.ir.transform.Sequential(
+        [tvm.tir.transform.Filter(
+            lambda f: "calling_conv" in f.attrs and
+            f.attrs["calling_conv"].value == CallingConv.DEVICE_KERNEL_LAUNCH),
+         tvm.tir.transform.LowerWarpMemory(),
+         tvm.tir.transform.LowerDeviceStorageAccessInfo(),
+         tvm.tir.transform.LowerIntrin()])
+    mod_dev = opt_device(mod_mixed)
+
+    # host optimizations
+    opt_host = tvm.ir.transform.Sequential(
+        [tvm.tir.transform.Filter(
+            lambda f: "calling_conv" not in f.attrs or
+            f.attrs["calling_conv"].value != CallingConv.DEVICE_KERNEL_LAUNCH),
+         tvm.tir.transform.Apply(lambda f: f.with_attr("target", target)),
+         tvm.tir.transform.LowerTVMBuiltin(),
+         tvm.tir.transform.LowerDeviceStorageAccessInfo(),
+         tvm.tir.transform.LowerIntrin(),
+         tvm.tir.transform.CombineContextCall()])
+    mod_host = opt_host(mod_mixed)
+
+    if device_type == ndarray.cpu(0).device_type and target_host == target:
+        assert len(mod_dev.functions) == 0
+    if "gpu" in target.keys and len(mod_dev.functions) == 0:
         warnings.warn(
             "Specified target %s, but cannot find device code, did you do "
             "bind?" % target)
 
-    fhost = [ir_pass.BindDeviceType(x, device_type) for x in fhost]
-    fhost = [ir_pass.LowerTVMBuiltin(x) for x in fhost]
-
-    if device_type == ndarray.cpu(0).device_type and target_host == target:
-        assert not fdevice
-
-    target_host = _target.create(target_host)
-    fdevice = [ir_pass.LowerDeviceStorageAccessInfo(x) for x in fdevice]
-    fhost = [ir_pass.LowerDeviceStorageAccessInfo(x) for x in fhost]
-    fdevice = [ir_pass.LowerIntrin(x, target.target_name) for x in fdevice]
-    fhost = [ir_pass.LowerIntrin(x, target_host.target_name) for x in fhost]
-    fhost = [ir_pass.CombineContextCall(x) for x in fhost]
-    mdev = codegen.build_module(fdevice, str(target)) if fdevice else None
-
-    return fhost, mdev
+    rt_mod_dev = codegen.build_module(mod_dev, target) if len(mod_dev.functions) != 0 else None
+    return mod_host, rt_mod_dev
 
 
 def build(inputs,
@@ -401,19 +407,19 @@ def build(inputs,
     if not target_host:
         target_host = "llvm" if tvm.runtime.enabled("llvm") else "stackvm"
 
-    fhost_all = []
+    mod_host_all = tvm.IRModule({})
+
     device_modules = []
     for tar, flist in target_flist.items():
-        fhost, mdev = _build_for_device(flist, tar, target_host)
-        # Save the current lowered functions of the host and the device module.
-        fhost_all += fhost
+        mod_host, mdev = _build_for_device(flist, tar, target_host)
+        mod_host_all.update(mod_host)
         device_modules.append(mdev)
 
     # Generate a unified host module.
-    mhost = codegen.build_module(fhost_all, str(target_host))
+    rt_mod_host = codegen.build_module(mod_host_all, target_host)
 
     # Import all modules.
     for mdev in device_modules:
         if mdev:
-            mhost.import_module(mdev)
-    return mhost
+            rt_mod_host.import_module(mdev)
+    return rt_mod_host
